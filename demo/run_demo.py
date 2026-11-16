@@ -265,8 +265,140 @@ def main() -> int:
             "new_run_cutoff": new_cutoff,
         })
 
+
+    # =====================================================================
+    # 11. Two-period revamp comparison
+    # =====================================================================
+    run_revamp_walkthrough(demo)
+
     print("\nALL STEPS COMPLETED")
     return 0
+
+
+def run_revamp_walkthrough(demo: "Demo") -> dict:
+    """Show the two-period comparison and the three competing explanations."""
+    mappings = demo.get("/v1/revamp/mappings")
+    if not mappings:
+        print("\n!! no revamp mapping seeded; skipping the revamp walkthrough")
+        return {}
+    mapping_seq = mappings[-1]["mapping_seq"]
+    mapping = demo.get(f"/v1/revamp/mappings/{mapping_seq}")
+    show("revamp mapping confirmed by an editor", {
+        "mapping_seq": mapping["mapping_seq"],
+        "confirmed_by": mapping["confirmed_by"],
+        "confirmed_role": mapping["confirmed_role"],
+        "slot_disclaimer": mapping["slot_disclaimer"],
+        "links": [
+            {
+                "relation": l["relation"],
+                "before": l["before_program_key"],
+                "after": l["after_program_key"],
+            }
+            for l in mapping["links"]
+        ],
+    })
+
+    frames = {r["batch_ref"]: r["batch_seq"] for r in demo.get("/v1/recruitment/batches")}
+    programs = {r["batch_ref"]: r["batch_seq"] for r in demo.get("/v1/programs/batches")}
+    targets = {r["batch_ref"]: r["batch_seq"] for r in demo.get("/v1/targets/batches")}
+    subs = demo.get("/v1/diary/submissions")
+    cutoff = demo.get("/v1/diary/cutoff")["available_max_submission_seq"]
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from demo import revamp_fixtures as RF
+
+    before_ids = {p["person_id"] for p in RF.before_persons()}
+    # Revision 1 of a before-period person is the before cutoff; paired people
+    # resubmit at revision 2 in the after period.
+    before_cut = max(
+        s["submission_seq"]
+        for s in subs
+        if s["person_id"] in before_ids and s["revision"] == 1
+    )
+
+    body = {
+        "note": "demo-revamp",
+        "mapping_seq": mapping_seq,
+        "reference_target_batch_seq": targets["revamp-targets-reference"],
+        "periods": {
+            "before": {
+                "recruitment_batch_seq": frames["revamp-frame-before"],
+                "target_batch_seq": targets["revamp-targets-before"],
+                "program_batch_seq": programs["revamp-schedule-before"],
+                "diary_seq_cutoff": before_cut,
+            },
+            "after": {
+                "recruitment_batch_seq": frames["revamp-frame-after"],
+                "target_batch_seq": targets["revamp-targets-after"],
+                "program_batch_seq": programs["revamp-schedule-after"],
+                "diary_seq_cutoff": cutoff,
+            },
+        },
+        "config": {"bootstrap": {"replicates": 200}},
+    }
+    created = demo.post("/v1/revamp/comparisons", body)
+    if created is None:
+        return {}
+    cid = created["comparison"]["comparison_id"]
+    demo.post(f"/v1/revamp/comparisons/{cid}/execute", {"max_steps": 50})
+    detail = demo.get(f"/v1/revamp/comparisons/{cid}")
+    show("revamp comparison status", {
+        "status": detail["status"],
+        "decomposition_order": detail["decomposition_order"],
+        "weight_version_hash": detail["weight_version"]["weight_version_hash"],
+        "bootstrap": {
+            "requested": (detail.get("bootstrap") or {}).get("requested"),
+            "success": (detail.get("bootstrap") or {}).get("success"),
+            "intervals_allowed": (detail.get("bootstrap") or {}).get("intervals_allowed"),
+        },
+        "paired": {
+            "status": (detail.get("paired") or {}).get("status"),
+            "paired_persons": (detail.get("paired") or {}).get("paired_persons"),
+        },
+    })
+    report = demo.get(f"/v1/revamp/comparisons/{cid}/report")
+    if report is None:
+        return {}
+    data = report["report"]
+    show("each comparable item: both periods, one reference, split and paired change", [
+        {
+            "item": i["comparison_key"],
+            "before_ref": i["before"]["mean_minutes_per_person"],
+            "after_ref": i["after"]["mean_minutes_per_person"],
+            "naive_diary_average_before": i["unweighted_diary_average"]["before"],
+            "naive_diary_average_after": i["unweighted_diary_average"]["after"],
+            "change_under_fixed_reference": i["change_under_fixed_reference"]["mean_minutes_per_person"],
+            "composition_part": i["decomposition"].get("composition_part"),
+            "behaviour_part": i["decomposition"].get("behaviour_part"),
+            "paired_change": i["paired"].get("change_mean_minutes_per_person"),
+            "paired_interval": i["paired"].get("interval"),
+        }
+        for i in data["comparable_items"]
+    ])
+    show("new and discontinued items are listed separately", [
+        {
+            "item": i["comparison_key"],
+            "relation": i["relation"],
+            "included_in_comparable_change": i["included_in_comparable_change"],
+        }
+        for i in data["new_and_discontinued"]
+    ])
+    show("paired design: what it cannot cover", {
+        "noncoverable": data["paired"]["noncoverable"],
+        "by_age_group": data["paired"]["noncoverable_by_group"]["age_band"],
+    })
+    show("coverage gaps per period (unweighted diarists vs fixed reference)", {
+        "before_undercovered": data["coverage"]["before"]["undercovered_groups"],
+        "after_undercovered": data["coverage"]["after"]["undercovered_groups"],
+    })
+    show("provenance stored with the report", {
+        "input_hash": data["provenance"]["input_hash"],
+        "weight_version_hash": data["provenance"]["weight_version_hash"],
+        "decomposition_order": data["provenance"]["decomposition_order"],
+    })
+    show("guardrails: this is a comparable change, not a causal claim",
+         data["interpretation"])
+    return {"comparison_id": cid, "report_hash": report["report_hash"]}
 
 
 if __name__ == "__main__":

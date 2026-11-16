@@ -19,6 +19,8 @@ from .models import (
     ExecuteIn,
     ProgramBatchIn,
     RecruitmentBatchIn,
+    RevampComparisonCreateIn,
+    RevampMappingIn,
     RunCreateIn,
     TargetBatchIn,
 )
@@ -93,6 +95,19 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         require_key(x_api_key, role="any")
         return "analyst" if x_api_key == settings.analyst_api_key else "admin"
 
+    def editor(x_api_key: str | None = Header(default=None)) -> str:
+        """Program mapping is an editorial decision, not an analyst one."""
+        if x_api_key is None or x_api_key.strip() == "":
+            raise invalid("api_key_required", "provide the X-API-Key header")
+        if x_api_key == settings.admin_api_key:
+            return "admin"
+        if x_api_key == settings.editor_api_key:
+            return "editor"
+        raise invalid(
+            "editor_key_required",
+            "confirming the before/after program mapping requires an editor key",
+        )
+
     # ---------------- meta ----------------
     @app.get("/health", tags=["meta"])
     def health():
@@ -152,7 +167,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         with db.scoped() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT batch_seq, population_total, dimension_totals, received_at FROM target_batches ORDER BY batch_seq"
+                "SELECT batch_seq, batch_ref, population_total, dimension_totals, received_at FROM target_batches ORDER BY batch_seq"
             )
             return [
                 {**r, "dimension_totals": loads(r["dimension_totals"]), "received_at": iso(r["received_at"])}
@@ -168,7 +183,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         with db.scoped() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT batch_seq, timezone, row_count, received_at FROM program_batches ORDER BY batch_seq"
+                "SELECT batch_seq, batch_ref, timezone, row_count, received_at FROM program_batches ORDER BY batch_seq"
             )
             return [
                 {**r, "received_at": iso(r["received_at"])} for r in cur.fetchall()
@@ -575,6 +590,204 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
                        inclusion_probability, base_weight, final_weight, eligible, exclusion_code, exclusion_detail
                   FROM run_persons WHERE {' AND '.join(clauses)}
                  ORDER BY person_id LIMIT %s OFFSET %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        return [
+            {**r, "exclusion_detail": loads(r["exclusion_detail"])}
+            for r in rows
+        ]
+
+    # ---------------- revamp comparison: program mapping (editor only) ----------------
+    @app.post("/v1/revamp/mappings", status_code=201, tags=["revamp"])
+    def post_revamp_mapping(body: RevampMappingIn, actor: str = Depends(editor)):
+        from .revamp_ingest import create_mapping
+
+        payload = body.model_dump(mode="json")
+        if actor == "admin" and payload.get("confirmed_by") in (None, ""):
+            payload["confirmed_by"] = "admin"
+        return create_mapping(db, payload, actor)
+
+    @app.get("/v1/revamp/mappings", tags=["revamp"])
+    def list_revamp_mappings(actor: str = Depends(analyst)):
+        from .revamp_ingest import list_mappings
+
+        return list_mappings(db)
+
+    @app.get("/v1/revamp/mappings/{mapping_seq}", tags=["revamp"])
+    def get_revamp_mapping(mapping_seq: int, actor: str = Depends(analyst)):
+        from .revamp_ingest import load_mapping
+
+        with db.scoped() as conn:
+            return load_mapping(conn.cursor(), mapping_seq)
+
+    # ---------------- revamp comparison ----------------
+    @app.post("/v1/revamp/comparisons", status_code=201, tags=["revamp"])
+    def post_revamp_comparison(body: RevampComparisonCreateIn, actor: str = Depends(analyst)):
+        from .revamp import create_comparison
+
+        return create_comparison(db, settings, body.model_dump(mode="json"), actor)
+
+    @app.get("/v1/revamp/comparisons", tags=["revamp"])
+    def list_revamp_comparisons(actor: str = Depends(analyst), limit: int = Query(default=50, le=500)):
+        from .revamp_report import public_comparison_summary
+
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM revamp_comparisons ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            return [public_comparison_summary(r) for r in cur.fetchall()]
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}", tags=["revamp"])
+    def get_revamp_comparison(comparison_id: str, actor: str = Depends(analyst)):
+        from .revamp import fetch_comparison
+
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            comp = fetch_comparison(cur, comparison_id)
+            cur.execute(
+                "SELECT stage, status, started_at, finished_at, payload, error FROM revamp_comparison_stages "
+                "WHERE comparison_id=%s ORDER BY stage",
+                (comparison_id,),
+            )
+            stages = [
+                {
+                    "stage": s["stage"],
+                    "status": s["status"],
+                    "started_at": iso(s["started_at"]),
+                    "finished_at": iso(s["finished_at"]),
+                    "payload": loads(s["payload"]),
+                    "error": loads(s["error"]),
+                }
+                for s in cur.fetchall()
+            ]
+        return {**comp, "stages": stages}
+
+    @app.post("/v1/revamp/comparisons/{comparison_id}/execute", tags=["revamp"])
+    def post_revamp_execute(comparison_id: str, body: ExecuteIn, actor: str = Depends(analyst)):
+        from .revamp import execute_comparison
+
+        return execute_comparison(db, comparison_id, body.max_steps)
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}/report", tags=["revamp"])
+    def get_revamp_report(comparison_id: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT report, report_hash, published_at FROM revamp_reports WHERE comparison_id=%s",
+                (comparison_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise not_found(
+                    "revamp_report_not_published",
+                    "no immutable comparison report exists (it may be rejected, failed, or still running)",
+                )
+        return {
+            "comparison_id": comparison_id,
+            "report_hash": row["report_hash"],
+            "published_at": iso(row["published_at"]),
+            "report": loads(row["report"]),
+        }
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}/items/{comparison_key}", tags=["revamp"])
+    def get_revamp_item(comparison_id: str, comparison_key: str, actor: str = Depends(analyst)):
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT payload FROM revamp_comparison_items WHERE comparison_id=%s AND comparison_key=%s",
+                (comparison_id, comparison_key),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise not_found("revamp_item_not_found", "no such comparison item")
+        return {"comparison_id": comparison_id, "comparison_key": comparison_key, "item": loads(row["payload"])}
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}/coverage", tags=["revamp"])
+    def get_revamp_coverage(comparison_id: str, actor: str = Depends(analyst)):
+        from .revamp import fetch_comparison
+
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            fetch_comparison(cur, comparison_id)
+            cur.execute(
+                "SELECT period_key, coverage, strata, exclusions FROM ("
+                "SELECT period_key, coverage, strata, NULL AS exclusions FROM revamp_comparison_periods "
+                "WHERE comparison_id=%s) q",
+                (comparison_id,),
+            )
+            rows = cur.fetchall()
+        return {
+            "comparison_id": comparison_id,
+            "periods": {r["period_key"]: {"coverage": loads(r["coverage"]), "strata": loads(r["strata"])} for r in rows},
+        }
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}/paired", tags=["revamp"])
+    def get_revamp_paired(comparison_id: str, actor: str = Depends(analyst)):
+        from .revamp import fetch_comparison
+
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            comp = fetch_comparison(cur, comparison_id)
+        return {"comparison_id": comparison_id, "paired": comp["paired"]}
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}/bootstrap", tags=["revamp"])
+    def get_revamp_bootstrap(comparison_id: str, actor: str = Depends(analyst)):
+        from .revamp import fetch_comparison
+
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            comp = fetch_comparison(cur, comparison_id)
+            cur.execute(
+                "SELECT replicate, payload FROM revamp_comparison_replicates WHERE comparison_id=%s ORDER BY replicate",
+                (comparison_id,),
+            )
+            reps = cur.fetchall()
+        failed = [
+            {"replicate": r["replicate"], "failure": (loads(r["payload"]) or {}).get("failure")}
+            for r in reps
+            if not (loads(r["payload"]) or {}).get("success")
+        ]
+        return {
+            "comparison_id": comparison_id,
+            "summary": comp["bootstrap"],
+            "replicates": len(reps),
+            "failed_replicates": failed,
+        }
+
+    @app.get("/v1/revamp/comparisons/{comparison_id}/persons", tags=["revamp"])
+    def get_revamp_persons(
+        comparison_id: str,
+        actor: str = Depends(analyst),
+        period: str | None = Query(default=None),
+        paired: bool | None = Query(default=None),
+        limit: int = Query(default=200, le=2000),
+        offset: int = Query(default=0, ge=0),
+    ):
+        clauses = ["comparison_id=%s"]
+        params: list[Any] = [comparison_id]
+        if period:
+            if period not in ("before", "after"):
+                raise invalid("period_unknown", "period must be before or after")
+            clauses.append("period_key=%s")
+            params.append(period)
+        if paired is not None:
+            clauses.append("paired=%s")
+            params.append(paired)
+        params.extend([limit, offset])
+        with db.scoped() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT period_key, person_id, household_id, strata_effective, age_band, region, sex,
+                       inclusion_probability, base_weight, reference_weight, own_target_weight,
+                       eligible, exclusion_code, exclusion_detail, paired, retention_probability,
+                       paired_design_weight, paired_weight
+                  FROM revamp_comparison_persons WHERE {' AND '.join(clauses)}
+                 ORDER BY period_key, person_id LIMIT %s OFFSET %s
                 """,
                 params,
             )

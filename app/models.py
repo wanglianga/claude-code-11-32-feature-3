@@ -196,3 +196,112 @@ class RunCreateIn(Strict):
 
 class ExecuteIn(Strict):
     max_steps: Annotated[int, Field(ge=1, le=100)] = 20
+
+
+# ---------------------------------------------------------------------------
+# Revamp comparison (two survey periods)
+# ---------------------------------------------------------------------------
+class ProgramSlotIn(Strict):
+    station: str = Field(min_length=1)
+    start_local: str = Field(pattern=r"^\d{1,2}:\d{2}$")
+    end_local: str = Field(pattern=r"^\d{1,2}:\d{2}$")
+
+
+class MappingLinkIn(Strict):
+    relation: Literal["unchanged", "renamed", "revamp", "discontinued", "new"] = Field(
+        description=(
+            "unchanged/renamed/revamp are comparable across periods; discontinued and new are "
+            "listed separately and never folded into the comparable change."
+        )
+    )
+    before_program_key: str | None = None
+    after_program_key: str | None = None
+    before_slots: list[ProgramSlotIn] = Field(default_factory=list)
+    after_slots: list[ProgramSlotIn] = Field(default_factory=list)
+    comparison_key: str | None = Field(
+        default=None, description="Stable key for this comparison item; defaults to the program key."
+    )
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _relation_shape(self):
+        comparable = self.relation in ("unchanged", "renamed", "revamp")
+        if comparable and not (self.before_program_key and self.after_program_key):
+            raise ValueError(f"relation {self.relation!r} needs both before and after program keys")
+        if self.relation == "discontinued" and not self.before_program_key:
+            raise ValueError("discontinued link needs before_program_key")
+        if self.relation == "new" and not self.after_program_key:
+            raise ValueError("new link needs after_program_key")
+        return self
+
+
+class RevampMappingIn(Strict):
+    mapping_ref: str | None = None
+    before_program_batch_seq: int = Field(ge=1)
+    after_program_batch_seq: int = Field(ge=1)
+    confirmed_by: str = Field(min_length=1, description="Editor who confirmed the program and slot mapping.")
+    confirmed_role: Literal["editor"] = "editor"
+    links: list[MappingLinkIn] = Field(min_length=1)
+
+
+class RevampPeriodInputsIn(Strict):
+    recruitment_batch_seq: int = Field(ge=1)
+    target_batch_seq: int = Field(ge=1)
+    program_batch_seq: int = Field(ge=1)
+    diary_seq_cutoff: int = Field(ge=0)
+
+
+class RevampPeriodsIn(Strict):
+    before: RevampPeriodInputsIn
+    after: RevampPeriodInputsIn
+
+
+class CorrectionIn(Strict):
+    parent_comparison_id: str = Field(min_length=1)
+    period: Literal["before", "after"]
+    reason: str = Field(min_length=1)
+
+
+class PairedIn(Strict):
+    enabled: bool = True
+    retention_floor: float = Field(
+        default=0.15,
+        ge=0,
+        le=1,
+        description="A retention cell below this share pauses the paired judgment instead of inflating its weight.",
+    )
+    min_paired_cell_persons: int = Field(default=3, ge=1)
+    max_absent_share: float = Field(
+        default=0.30,
+        ge=0,
+        le=1,
+        description="Absent-family share above which the paired estimate is paused as too dependent on the retention model.",
+    )
+
+
+class RevampConfigIn(Strict):
+    timezone: str | None = None
+    completeness: CompletenessIn = Field(default_factory=CompletenessIn)
+    raking: RakingIn = Field(default_factory=RakingIn)
+    bootstrap: BootstrapIn = Field(default_factory=BootstrapIn)
+    thresholds: ThresholdsIn = Field(default_factory=ThresholdsIn)
+    paired: PairedIn = Field(default_factory=PairedIn)
+    decomposition_order: Literal["before_shares", "after_shares"] = Field(
+        default="before_shares",
+        description=(
+            "Order used to split the uncalibrated period-to-period change into a behaviour part and a "
+            "sample-composition part. The chosen order is stored with the report; neither part is causal."
+        ),
+    )
+
+
+class RevampComparisonCreateIn(Strict):
+    note: str | None = None
+    mapping_seq: int = Field(ge=1)
+    reference_target_batch_seq: int = Field(
+        ge=1, description="Fixed reference population both periods are calibrated to."
+    )
+    periods: RevampPeriodsIn
+    correction: CorrectionIn | None = None
+    config: RevampConfigIn = Field(default_factory=RevampConfigIn)
+    seed: int | None = None

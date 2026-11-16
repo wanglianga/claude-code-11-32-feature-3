@@ -29,6 +29,7 @@ services:
       AUDIENCE_SERVICE_TZ: Asia/Shanghai
       AUDIENCE_ADMIN_API_KEY: dev-admin-key
       AUDIENCE_ANALYST_API_KEY: dev-analyst-key
+      AUDIENCE_EDITOR_API_KEY: dev-editor-key
       AUDIENCE_SEED_ON_START: "1"
     depends_on:
       db:

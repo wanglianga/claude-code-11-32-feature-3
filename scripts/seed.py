@@ -82,6 +82,48 @@ def ingest_diaries(db: Database, tz, include_resubmission: bool = True) -> dict:
     }
 
 
+def seed_revamp(db: Database, tz) -> dict:
+    """Seed the two-period revamp fixture and its editor-confirmed mapping."""
+    from demo import revamp_fixtures as RF
+
+    actor = "seed"
+    frames, targets, programs = {}, {}, {}
+    rec = RF.recruitment_batches()
+    tgt = RF.target_batches()
+    prg = RF.program_batches()
+    for period in ("before", "after"):
+        frames[period] = ingest.create_recruitment_batch(db, rec[period], actor)["batch_seq"]
+        targets[period] = ingest.create_target_batch(db, tgt[period], actor)["batch_seq"]
+        programs[period] = ingest.create_program_batch(db, prg[period], actor)["batch_seq"]
+    reference = ingest.create_target_batch(db, tgt["reference"], actor)["batch_seq"]
+
+    before_ids = {p["person_id"] for p in RF.before_persons()}
+    before_cutoff = 0
+    after_cutoff = 0
+    for sub in RF.diary_submissions():
+        seq = ingest.create_diary_submission(db, sub, actor, tz)["submission_seq"]
+        # A before-period diary is revision 1 for a before-period person. Paired
+        # people resubmit in the after period at revision 2, so revision alone
+        # separates the two cutoffs without touching the later rows.
+        if sub["person_id"] in before_ids and sub["revision"] == 1:
+            before_cutoff = max(before_cutoff, seq)
+        after_cutoff = max(after_cutoff, seq)
+
+    from app import revamp_ingest
+
+    mapping = revamp_ingest.create_mapping(
+        db, RF.mapping_payload(programs["before"], programs["after"]), "seed-editor"
+    )
+    return {
+        "frames": frames,
+        "targets": targets,
+        "programs": programs,
+        "reference_target_batch_seq": reference,
+        "cutoffs": {"before": before_cutoff, "after": after_cutoff},
+        "mapping_seq": mapping["mapping_seq"],
+    }
+
+
 def db_has_data(db: Database) -> bool:
     with db.scoped() as conn:
         cur = conn.cursor()
@@ -106,7 +148,8 @@ def main() -> None:
 
     tz = ZoneInfo(settings.service_timezone)
     diaries = ingest_diaries(db, tz)
-    print({"seeded": seeded, "diaries": diaries})
+    revamp = seed_revamp(db, tz)
+    print({"seeded": seeded, "diaries": diaries, "revamp": revamp})
     db.close()
 
 

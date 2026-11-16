@@ -375,3 +375,150 @@ DROP TRIGGER IF EXISTS run_reports_no_update ON run_reports;
 CREATE TRIGGER run_reports_no_update
     BEFORE UPDATE OR DELETE ON run_reports
     FOR EACH ROW EXECUTE FUNCTION forbid_report_mutation();
+
+-- ---------------------------------------------------------------------------
+-- Revamp comparison: two survey periods, an editor-confirmed program mapping,
+-- a fixed reference population and an optional paired (both-period) panel.
+--
+-- Everything here is append-only or immutable once published. A correction to
+-- one period never rewrites a published comparison report; it creates a new
+-- comparison whose parent is the earlier one.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS revamp_program_mappings (
+    mapping_seq                BIGSERIAL PRIMARY KEY,
+    mapping_ref                TEXT UNIQUE,
+    before_program_batch_seq   BIGINT NOT NULL REFERENCES program_batches(batch_seq),
+    after_program_batch_seq    BIGINT NOT NULL REFERENCES program_batches(batch_seq),
+    confirmed_by               TEXT NOT NULL,
+    confirmed_role             TEXT NOT NULL,
+    confirmed_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    slot_disclaimer            TEXT NOT NULL,
+    payload                    JSONB NOT NULL,
+    payload_hash               TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS revamp_comparisons (
+    comparison_id              UUID PRIMARY KEY,
+    status                     TEXT NOT NULL,
+    parent_comparison_id       UUID REFERENCES revamp_comparisons(comparison_id),
+    mapping_seq                BIGINT NOT NULL REFERENCES revamp_program_mappings(mapping_seq),
+    reference_target_batch_seq BIGINT NOT NULL REFERENCES target_batches(batch_seq),
+    seed                       BIGINT,
+    periods                    JSONB NOT NULL,
+    config                     JSONB NOT NULL,
+    config_hash                TEXT NOT NULL,
+    input_hash                 TEXT NOT NULL,
+    correction                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    decomposition_order        JSONB NOT NULL,
+    weight_version             JSONB,
+    calibration                JSONB,
+    paired                     JSONB,
+    bootstrap                  JSONB,
+    interval_status            TEXT,
+    failure                    JSONB,
+    note                       TEXT,
+    created_by                 TEXT NOT NULL,
+    created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at                TIMESTAMPTZ,
+    published_at               TIMESTAMPTZ,
+    CHECK (status IN ('created','running','published','rejected','failed'))
+);
+
+CREATE TABLE IF NOT EXISTS revamp_comparison_stages (
+    comparison_id UUID NOT NULL REFERENCES revamp_comparisons(comparison_id),
+    stage         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    started_at    TIMESTAMPTZ,
+    finished_at   TIMESTAMPTZ,
+    payload       JSONB,
+    error         JSONB,
+    PRIMARY KEY (comparison_id, stage),
+    CHECK (status IN ('pending','running','done','failed'))
+);
+
+CREATE TABLE IF NOT EXISTS revamp_comparison_periods (
+    comparison_id  UUID NOT NULL REFERENCES revamp_comparisons(comparison_id),
+    period_key     TEXT NOT NULL,
+    survey_period  JSONB NOT NULL,
+    input_hash     TEXT NOT NULL,
+    eligible_persons   INTEGER NOT NULL,
+    eligible_households INTEGER NOT NULL,
+    eligible_weighted_population NUMERIC(20,4),
+    calibration    JSONB NOT NULL,
+    own_target_calibration JSONB NOT NULL,
+    coverage       JSONB NOT NULL,
+    strata         JSONB NOT NULL,
+    estimates      JSONB NOT NULL,
+    PRIMARY KEY (comparison_id, period_key),
+    CHECK (period_key IN ('before','after'))
+);
+
+CREATE TABLE IF NOT EXISTS revamp_comparison_persons (
+    comparison_id      UUID NOT NULL REFERENCES revamp_comparisons(comparison_id),
+    period_key         TEXT NOT NULL,
+    person_id          TEXT NOT NULL,
+    household_id       TEXT NOT NULL,
+    strata             TEXT NOT NULL,
+    strata_effective   TEXT NOT NULL,
+    age_band           TEXT NOT NULL,
+    region             TEXT NOT NULL,
+    sex                TEXT NOT NULL,
+    inclusion_probability NUMERIC(18,10),
+    base_weight        NUMERIC(20,8),
+    reference_weight   NUMERIC(20,8),
+    own_target_weight  NUMERIC(20,8),
+    eligible           BOOLEAN NOT NULL,
+    exclusion_code     TEXT,
+    exclusion_detail   JSONB,
+    paired             BOOLEAN NOT NULL DEFAULT FALSE,
+    retention_probability NUMERIC(12,8),
+    paired_design_weight  NUMERIC(20,8),
+    paired_weight         NUMERIC(20,8),
+    program_minutes       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    listening_minutes_total NUMERIC(14,3),
+    PRIMARY KEY (comparison_id, period_key, person_id),
+    CHECK (period_key IN ('before','after'))
+);
+
+-- Added after the first delivery; safe to re-run on an existing schema.
+ALTER TABLE revamp_comparison_persons
+    ADD COLUMN IF NOT EXISTS program_minutes JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE revamp_comparison_persons
+    ADD COLUMN IF NOT EXISTS listening_minutes_total NUMERIC(14,3);
+
+CREATE TABLE IF NOT EXISTS revamp_comparison_items (
+    comparison_id  UUID NOT NULL REFERENCES revamp_comparisons(comparison_id),
+    comparison_key TEXT NOT NULL,
+    payload        JSONB NOT NULL,
+    PRIMARY KEY (comparison_id, comparison_key)
+);
+
+CREATE TABLE IF NOT EXISTS revamp_comparison_households (
+    comparison_id UUID NOT NULL REFERENCES revamp_comparisons(comparison_id),
+    household_id  TEXT NOT NULL,
+    payload       JSONB NOT NULL,
+    PRIMARY KEY (comparison_id, household_id)
+);
+
+CREATE TABLE IF NOT EXISTS revamp_comparison_replicates (
+    comparison_id UUID NOT NULL REFERENCES revamp_comparisons(comparison_id),
+    replicate     INTEGER NOT NULL,
+    payload       JSONB NOT NULL,
+    PRIMARY KEY (comparison_id, replicate)
+);
+
+CREATE TABLE IF NOT EXISTS revamp_reports (
+    comparison_id UUID PRIMARY KEY REFERENCES revamp_comparisons(comparison_id),
+    report        JSONB NOT NULL,
+    report_hash   TEXT NOT NULL,
+    published_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE revamp_comparisons ADD COLUMN IF NOT EXISTS seed BIGINT;
+
+DROP TRIGGER IF EXISTS revamp_reports_no_update ON revamp_reports;
+CREATE TRIGGER revamp_reports_no_update
+    BEFORE UPDATE OR DELETE ON revamp_reports
+    FOR EACH ROW EXECUTE FUNCTION forbid_report_mutation();

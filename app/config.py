@@ -15,6 +15,7 @@ class Settings:
     database_url: str
     admin_api_key: str
     analyst_api_key: str
+    editor_api_key: str = "dev-editor-key"
     default_schema: str = "audience"
     service_timezone: str = "Asia/Shanghai"
 
@@ -35,6 +36,7 @@ def get_settings() -> Settings:
         ),
         admin_api_key=_env("AUDIENCE_ADMIN_API_KEY", "dev-admin-key"),
         analyst_api_key=_env("AUDIENCE_ANALYST_API_KEY", "dev-analyst-key"),
+        editor_api_key=_env("AUDIENCE_EDITOR_API_KEY", "dev-editor-key"),
         default_schema=_env("AUDIENCE_DB_SCHEMA", "audience"),
         service_timezone=_env("AUDIENCE_SERVICE_TZ", "Asia/Shanghai"),
     )

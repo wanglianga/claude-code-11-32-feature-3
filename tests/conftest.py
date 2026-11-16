@@ -28,6 +28,7 @@ def _settings(schema: str) -> Settings:
         database_url=TEST_DB_URL,
         admin_api_key="test-admin-key",
         analyst_api_key="test-analyst-key",
+        editor_api_key="test-editor-key",
         default_schema=schema,
         service_timezone="Asia/Shanghai",
     )

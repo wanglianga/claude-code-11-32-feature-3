@@ -25,7 +25,8 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV AUDIENCE_DB_SCHEMA=audience \
     AUDIENCE_SERVICE_TZ=Asia/Shanghai \
     AUDIENCE_ADMIN_API_KEY=dev-admin-key \
-    AUDIENCE_ANALYST_API_KEY=dev-analyst-key
+    AUDIENCE_ANALYST_API_KEY=dev-analyst-key \
+    AUDIENCE_EDITOR_API_KEY=dev-editor-key
 
 EXPOSE 8000
 
